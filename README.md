@@ -10,6 +10,9 @@ A Discord server minigame bot with its own virtual currency.
 - `/guess` — Guess a number from 1–10, optional bet
 - `/trivia` — 15-second trivia round
 - `/blacktea` — Type a word containing the shown letters before time runs out
+- `/tictactoe` — Challenge another member using clickable board buttons
+- `/uno` — Two-player UNO with private hands and public game status
+- `/challenge` — Challenge another member to supported multiplayer games
 
 ## Economy
 
@@ -20,6 +23,8 @@ A Discord server minigame bot with its own virtual currency.
 - `/stats`
 
 New users begin with 500 🍋. Daily rewards give 250 🍋. Game balances and stats are stored in SQLite and persist between restarts as long as `limelight.db` is kept.
+
+Multiplayer games can optionally use a wager. Both players must have enough coins before the challenge starts. The winner gains the wager amount and the loser loses the same amount.
 
 ## Setup
 
@@ -35,4 +40,4 @@ The bot syncs its slash commands automatically when it starts.
 
 ## Important
 
-The betting system uses Limelight's fictional in-server currency only. It does not support real money, Robux, crypto, gift cards, or cash-value prizes.
+The wagering system uses Limelight's fictional in-server currency only. It does not support real money, Robux, crypto, gift cards, or cash-value prizes.
