@@ -38,6 +38,13 @@ def init_db():
                 last_daily TEXT
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS marriages (
+                user_id INTEGER PRIMARY KEY,
+                partner_id INTEGER NOT NULL,
+                married_at TEXT NOT NULL
+            )
+        """)
 
 
 def ensure_user(user_id: int):
@@ -95,6 +102,30 @@ def can_bet(user_id: int, amount: int) -> bool:
     return get_user(user_id)[0] >= amount
 
 
+def get_partner_id(user_id: int):
+    with db() as con:
+        row = con.execute("SELECT partner_id FROM marriages WHERE user_id = ?", (user_id,)).fetchone()
+        return row[0] if row else None
+
+
+def marry_users(user_a: int, user_b: int):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO marriages (user_id, partner_id, married_at) VALUES (?, ?, ?)", (user_a, user_b, now))
+        con.execute("INSERT OR REPLACE INTO marriages (user_id, partner_id, married_at) VALUES (?, ?, ?)", (user_b, user_a, now))
+
+
+def divorce_users(user_a: int, user_b: int):
+    with db() as con:
+        con.execute("DELETE FROM marriages WHERE user_id IN (?, ?)", (user_a, user_b))
+
+
+def ship_score(user_a: int, user_b: int) -> int:
+    low, high = sorted((user_a, user_b))
+    seeded = random.Random(f"limelight:{low}:{high}")
+    return seeded.randint(0, 100)
+
+
 @bot.event
 async def on_ready():
     init_db()
@@ -113,26 +144,11 @@ async def help_cmd(interaction: discord.Interaction):
         description="Play games, earn virtual coins, challenge friends, and climb the leaderboard.",
         color=LIME,
     )
-    embed.add_field(
-        name="🎮 Solo games",
-        value="`/rps` `/coinflip` `/dice` `/guess` `/trivia` `/blacktea`",
-        inline=False,
-    )
-    embed.add_field(
-        name="👥 Multiplayer",
-        value="`/tictactoe` `/uno` `/challenge`",
-        inline=False,
-    )
-    embed.add_field(
-        name="💰 Economy",
-        value="`/balance` `/daily` `/pay` `/leaderboard` `/stats`",
-        inline=False,
-    )
-    embed.add_field(
-        name="🎰 Wagers",
-        value="Optional wagers use Limelight's virtual 🍋 coins only and have no real-world value.",
-        inline=False,
-    )
+    embed.add_field(name="🎮 Solo games", value="`/rps` `/coinflip` `/dice` `/guess` `/trivia` `/blacktea`", inline=False)
+    embed.add_field(name="👥 Multiplayer", value="`/tictactoe` `/uno` `/challenge`", inline=False)
+    embed.add_field(name="💚 Social", value="`/ship` `/marry` `/partner` `/divorce`", inline=False)
+    embed.add_field(name="💰 Economy", value="`/balance` `/daily` `/pay` `/leaderboard` `/stats`", inline=False)
+    embed.add_field(name="🎰 Wagers", value="Optional wagers use Limelight's virtual 🍋 coins only and have no real-world value.", inline=False)
     await interaction.response.send_message(embed=embed)
 
 
@@ -156,16 +172,10 @@ async def daily(interaction: discord.Interaction):
             remaining = next_claim - now
             hours, rem = divmod(int(remaining.total_seconds()), 3600)
             minutes = rem // 60
-            await interaction.response.send_message(
-                f"⏳ You already claimed your daily. Try again in **{hours}h {minutes}m**.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message(f"⏳ You already claimed your daily. Try again in **{hours}h {minutes}m**.", ephemeral=True)
             return
     with db() as con:
-        con.execute(
-            "UPDATE users SET balance = balance + ?, last_daily = ? WHERE user_id = ?",
-            (DAILY_REWARD, now.isoformat(), user_id),
-        )
+        con.execute("UPDATE users SET balance = balance + ?, last_daily = ? WHERE user_id = ?", (DAILY_REWARD, now.isoformat(), user_id))
     await interaction.response.send_message(f"🎁 Daily claimed! You received **{fmt(DAILY_REWARD)}**.")
 
 
@@ -212,9 +222,100 @@ async def leaderboard(interaction: discord.Interaction):
         name = member.display_name if member else f"User {user_id}"
         prefix = medals[i] if i < 3 else f"**{i + 1}.**"
         lines.append(f"{prefix} {name} — **{fmt(balance_value)}**")
-    await interaction.response.send_message(
-        embed=discord.Embed(title="🏆 Limelight Rich List", description="\n".join(lines), color=LIME)
-    )
+    await interaction.response.send_message(embed=discord.Embed(title="🏆 Limelight Rich List", description="\n".join(lines), color=LIME))
+
+
+@bot.tree.command(name="ship", description="Get a fun compatibility score for two server members")
+@app_commands.describe(member1="First member", member2="Second member (defaults to you)")
+async def ship(interaction: discord.Interaction, member1: discord.Member, member2: discord.Member | None = None):
+    second = member2 or interaction.user
+    if member1.bot or second.bot:
+        await interaction.response.send_message("Pick two real server members.", ephemeral=True)
+        return
+    if member1.id == second.id:
+        await interaction.response.send_message("💚 Self-confidence score: **100%**")
+        return
+    score = ship_score(member1.id, second.id)
+    filled = round(score / 10)
+    bar = "💚" * filled + "🤍" * (10 - filled)
+    if score >= 90:
+        line = "Legendary duo energy."
+    elif score >= 70:
+        line = "Strong match."
+    elif score >= 50:
+        line = "Could be a solid duo."
+    elif score >= 30:
+        line = "Mixed signals."
+    else:
+        line = "Probably better as teammates."
+    embed = discord.Embed(title="💚 Limelight Ship Meter", description=f"{member1.mention} × {second.mention}\n\n{bar}\n**{score}%** — {line}", color=LIME)
+    await interaction.response.send_message(embed=embed)
+
+
+class MarriageProposalView(discord.ui.View):
+    def __init__(self, proposer: discord.Member, target: discord.Member):
+        super().__init__(timeout=60)
+        self.proposer = proposer
+        self.target = target
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.target.id:
+            await interaction.response.send_message("Only the person who was asked can answer this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="💚")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if get_partner_id(self.proposer.id) or get_partner_id(self.target.id):
+            await interaction.response.edit_message(content="That proposal can't be completed because one of you already has a partner.", view=None)
+            self.stop()
+            return
+        marry_users(self.proposer.id, self.target.id)
+        await interaction.response.edit_message(content=f"💚 {self.proposer.mention} and {self.target.mention} are now paired on Limelight!", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="✖️")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=f"❌ {self.target.mention} declined the proposal.", view=None)
+        self.stop()
+
+
+@bot.tree.command(name="marry", description="Send another server member a Limelight marriage proposal")
+@app_commands.describe(member="Member to propose to")
+async def marry(interaction: discord.Interaction, member: discord.Member):
+    if member.bot or member.id == interaction.user.id:
+        await interaction.response.send_message("Choose another real server member.", ephemeral=True)
+        return
+    if get_partner_id(interaction.user.id):
+        await interaction.response.send_message("You already have a partner. Use `/divorce` first.", ephemeral=True)
+        return
+    if get_partner_id(member.id):
+        await interaction.response.send_message(f"{member.display_name} already has a partner.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"💚 {member.mention}, {interaction.user.mention} sent you a Limelight marriage proposal!", view=MarriageProposalView(interaction.user, member))
+
+
+@bot.tree.command(name="partner", description="See someone's Limelight partner")
+@app_commands.describe(member="Member to check")
+async def partner(interaction: discord.Interaction, member: discord.Member | None = None):
+    target = member or interaction.user
+    partner_id = get_partner_id(target.id)
+    if not partner_id:
+        await interaction.response.send_message(f"💚 **{target.display_name}** doesn't have a Limelight partner right now.")
+        return
+    partner_member = interaction.guild.get_member(partner_id) if interaction.guild else None
+    partner_text = partner_member.mention if partner_member else f"<@{partner_id}>"
+    await interaction.response.send_message(f"💚 **{target.display_name}** is paired with {partner_text}.")
+
+
+@bot.tree.command(name="divorce", description="End your Limelight marriage")
+async def divorce(interaction: discord.Interaction):
+    partner_id = get_partner_id(interaction.user.id)
+    if not partner_id:
+        await interaction.response.send_message("You don't currently have a Limelight partner.", ephemeral=True)
+        return
+    divorce_users(interaction.user.id, partner_id)
+    await interaction.response.send_message(f"💔 {interaction.user.mention}'s Limelight marriage with <@{partner_id}> has ended.")
 
 
 RPS_CHOICES = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
@@ -222,11 +323,7 @@ RPS_CHOICES = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
 
 @bot.tree.command(name="rps", description="Play rock paper scissors against Limelight")
 @app_commands.describe(choice="Your move", bet="Virtual coins to wager")
-@app_commands.choices(choice=[
-    app_commands.Choice(name="Rock", value="rock"),
-    app_commands.Choice(name="Paper", value="paper"),
-    app_commands.Choice(name="Scissors", value="scissors"),
-])
+@app_commands.choices(choice=[app_commands.Choice(name="Rock", value="rock"), app_commands.Choice(name="Paper", value="paper"), app_commands.Choice(name="Scissors", value="scissors")])
 async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str], bet: app_commands.Range[int, 0, 1000000] = 0):
     if bet and not can_bet(interaction.user.id, bet):
         await interaction.response.send_message("You don't have enough coins for that bet.", ephemeral=True)
@@ -252,17 +349,12 @@ async def rps(interaction: discord.Interaction, choice: app_commands.Choice[str]
     else:
         record_tie(interaction.user.id)
         text = "🤝 Tie — your wager is unchanged."
-    await interaction.response.send_message(
-        f"You: {RPS_CHOICES[player]} **{player.title()}**\nLimelight: {RPS_CHOICES[computer]} **{computer.title()}**\n\n{text}"
-    )
+    await interaction.response.send_message(f"You: {RPS_CHOICES[player]} **{player.title()}**\nLimelight: {RPS_CHOICES[computer]} **{computer.title()}**\n\n{text}")
 
 
 @bot.tree.command(name="coinflip", description="Bet virtual coins on heads or tails")
 @app_commands.describe(side="Heads or tails", bet="Virtual coins to wager")
-@app_commands.choices(side=[
-    app_commands.Choice(name="Heads", value="heads"),
-    app_commands.Choice(name="Tails", value="tails"),
-])
+@app_commands.choices(side=[app_commands.Choice(name="Heads", value="heads"), app_commands.Choice(name="Tails", value="tails")])
 async def coinflip(interaction: discord.Interaction, side: app_commands.Choice[str], bet: app_commands.Range[int, 1, 1000000]):
     if not can_bet(interaction.user.id, bet):
         await interaction.response.send_message("You don't have enough coins for that bet.", ephemeral=True)
@@ -322,16 +414,7 @@ async def guess(interaction: discord.Interaction, number: app_commands.Range[int
     await interaction.response.send_message(text)
 
 
-TRIVIA = [
-    ("What planet is known as the Red Planet?", "mars"),
-    ("How many sides does a hexagon have?", "6"),
-    ("What is the largest ocean on Earth?", "pacific"),
-    ("What game uses creepers, redstone, and diamonds?", "minecraft"),
-    ("What color do you get by mixing blue and yellow?", "green"),
-    ("How many days are in a leap year?", "366"),
-    ("What is 9 x 9?", "81"),
-    ("Which animal is known as man's best friend?", "dog"),
-]
+TRIVIA = [("What planet is known as the Red Planet?", "mars"), ("How many sides does a hexagon have?", "6"), ("What is the largest ocean on Earth?", "pacific"), ("What game uses creepers, redstone, and diamonds?", "minecraft"), ("What color do you get by mixing blue and yellow?", "green"), ("How many days are in a leap year?", "366"), ("What is 9 x 9?", "81"), ("Which animal is known as man's best friend?", "dog")]
 
 
 @bot.tree.command(name="trivia", description="Answer a quick trivia question")
@@ -389,7 +472,6 @@ class ChallengeView(discord.ui.View):
         self.opponent = opponent
         self.game = game
         self.wager = wager
-        self.message = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.opponent.id:
@@ -406,15 +488,10 @@ class ChallengeView(discord.ui.View):
         await interaction.response.edit_message(content=f"✅ {self.opponent.mention} accepted! Starting **{self.game}**...", view=None)
         self.stop()
         if self.game == "tictactoe":
-            await interaction.followup.send(
-                f"❌ {self.challenger.mention} vs ⭕ {self.opponent.mention}" + (f" — **{fmt(self.wager)} each**" if self.wager else ""),
-                view=TicTacToeView(self.challenger, self.opponent, self.wager),
-            )
+            await interaction.followup.send(f"❌ {self.challenger.mention} vs ⭕ {self.opponent.mention}" + (f" — **{fmt(self.wager)} each**" if self.wager else ""), view=TicTacToeView(self.challenger, self.opponent, self.wager))
         elif self.game == "uno":
             game = UnoGameView(self.challenger, self.opponent, self.wager)
             await game.start(interaction)
-        elif self.game == "rps":
-            await interaction.followup.send("Use `/rpsduel` to play the accepted RPS duel.")
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="✖️")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -424,10 +501,7 @@ class ChallengeView(discord.ui.View):
 
 @bot.tree.command(name="challenge", description="Challenge another player to a wagered minigame")
 @app_commands.describe(member="Player to challenge", game="Game to play", wager="Virtual coins each player wagers")
-@app_commands.choices(game=[
-    app_commands.Choice(name="Tic-Tac-Toe", value="tictactoe"),
-    app_commands.Choice(name="UNO", value="uno"),
-])
+@app_commands.choices(game=[app_commands.Choice(name="Tic-Tac-Toe", value="tictactoe"), app_commands.Choice(name="UNO", value="uno")])
 async def challenge(interaction: discord.Interaction, member: discord.Member, game: app_commands.Choice[str], wager: app_commands.Range[int, 0, 1000000] = 0):
     if member.bot or member.id == interaction.user.id:
         await interaction.response.send_message("Choose another real player.", ephemeral=True)
@@ -439,8 +513,7 @@ async def challenge(interaction: discord.Interaction, member: discord.Member, ga
     text = f"🎮 {member.mention}, {interaction.user.mention} challenged you to **{game.name}**"
     if wager:
         text += f" for **{fmt(wager)} each**"
-    text += "."
-    await interaction.response.send_message(text, view=view)
+    await interaction.response.send_message(text + ".", view=view)
 
 
 class TicTacToeButton(discord.ui.Button):
@@ -473,9 +546,7 @@ class TicTacToeButton(discord.ui.Button):
                     change_balance(lose_member.id, -view.wager)
                 record_result(win_member.id, True)
                 record_result(lose_member.id, False)
-                result = f"🏆 {win_member.mention} wins!"
-                if view.wager:
-                    result += f" **+{fmt(view.wager)}**"
+                result = f"🏆 {win_member.mention} wins!" + (f" **+{fmt(view.wager)}**" if view.wager else "")
             else:
                 record_tie(view.player_x.id)
                 record_tie(view.player_o.id)
@@ -499,8 +570,7 @@ class TicTacToeView(discord.ui.View):
             self.add_item(TicTacToeButton(i))
 
     def check_winner(self):
-        lines = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-        for a,b,c in lines:
+        for a, b, c in [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]:
             if self.board[a] and self.board[a] == self.board[b] == self.board[c]:
                 return self.board[a]
         return None
@@ -515,11 +585,7 @@ async def tictactoe(interaction: discord.Interaction, member: discord.Member, wa
     if wager and (not can_bet(interaction.user.id, wager) or not can_bet(member.id, wager)):
         await interaction.response.send_message("Both players need enough coins for that wager.", ephemeral=True)
         return
-    view = ChallengeView(interaction.user, member, "tictactoe", wager)
-    await interaction.response.send_message(
-        f"❌⭕ {member.mention}, {interaction.user.mention} challenged you to Tic-Tac-Toe" + (f" for **{fmt(wager)} each**." if wager else "."),
-        view=view,
-    )
+    await interaction.response.send_message(f"❌⭕ {member.mention}, {interaction.user.mention} challenged you to Tic-Tac-Toe" + (f" for **{fmt(wager)} each**." if wager else "."), view=ChallengeView(interaction.user, member, "tictactoe", wager))
 
 
 UNO_COLORS = ["Red", "Blue", "Green", "Yellow"]
@@ -547,8 +613,7 @@ class UnoHandSelect(discord.ui.Select):
     def __init__(self, game, player_id):
         self.game = game
         self.player_id = player_id
-        hand = game.hands[player_id]
-        options = [discord.SelectOption(label=card_text(card)[:100], value=str(i)) for i, card in enumerate(hand[:25])]
+        options = [discord.SelectOption(label=card_text(card)[:100], value=str(i)) for i, card in enumerate(game.hands[player_id][:25])]
         super().__init__(placeholder="Choose a card to play", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
@@ -569,10 +634,7 @@ class UnoHandSelect(discord.ui.Select):
             return
         game.hands[self.player_id].pop(idx)
         game.discard = card
-        if card[0] == "Wild":
-            game.active_color = random.choice(UNO_COLORS)
-        else:
-            game.active_color = card[0]
+        game.active_color = random.choice(UNO_COLORS) if card[0] == "Wild" else card[0]
         other = game.other_player(game.current)
         if card[1] == "+2":
             game.draw_cards(other.id, 2)
@@ -643,13 +705,7 @@ class UnoGameView(discord.ui.View):
         return drawn
 
     def public_text(self):
-        return (
-            f"🃏 **UNO**\nTop card: **{card_text(self.discard)}**\n"
-            f"Active color: **{UNO_EMOJI[self.active_color]} {self.active_color}**\n\n"
-            f"{self.p1.mention}: **{len(self.hands[self.p1.id])} cards**\n"
-            f"{self.p2.mention}: **{len(self.hands[self.p2.id])} cards**\n\n"
-            f"➡️ Turn: {self.current.mention}"
-        )
+        return f"🃏 **UNO**\nTop card: **{card_text(self.discard)}**\nActive color: **{UNO_EMOJI[self.active_color]} {self.active_color}**\n\n{self.p1.mention}: **{len(self.hands[self.p1.id])} cards**\n{self.p2.mention}: **{len(self.hands[self.p2.id])} cards**\n\n➡️ Turn: {self.current.mention}"
 
     async def start(self, interaction: discord.Interaction):
         self.message = await interaction.followup.send(self.public_text(), wait=True)
@@ -658,11 +714,7 @@ class UnoGameView(discord.ui.View):
 
     async def send_hand(self, interaction: discord.Interaction, player: discord.Member):
         hand_text = "\n".join(f"{i+1}. {card_text(c)}" for i, c in enumerate(self.hands[player.id]))
-        await interaction.followup.send(
-            f"🃏 **Your UNO hand**\n{hand_text}\n\nUse the menu below on your turn.",
-            view=UnoPrivateView(self, player.id),
-            ephemeral=True,
-        )
+        await interaction.followup.send(f"🃏 **Your UNO hand**\n{hand_text}\n\nUse the menu below on your turn.", view=UnoPrivateView(self, player.id), ephemeral=True)
 
     async def update_public(self, interaction: discord.Interaction):
         if self.message:
@@ -676,9 +728,7 @@ class UnoGameView(discord.ui.View):
             change_balance(loser.id, -self.wager)
         record_result(winner.id, True)
         record_result(loser.id, False)
-        text = f"🏆 {winner.mention} wins UNO!"
-        if self.wager:
-            text += f" **+{fmt(self.wager)}**"
+        text = f"🏆 {winner.mention} wins UNO!" + (f" **+{fmt(self.wager)}**" if self.wager else "")
         if self.message:
             await self.message.edit(content=text, view=None)
         else:
@@ -695,11 +745,7 @@ async def uno(interaction: discord.Interaction, member: discord.Member, wager: a
     if wager and (not can_bet(interaction.user.id, wager) or not can_bet(member.id, wager)):
         await interaction.response.send_message("Both players need enough coins for that wager.", ephemeral=True)
         return
-    view = ChallengeView(interaction.user, member, "uno", wager)
-    await interaction.response.send_message(
-        f"🃏 {member.mention}, {interaction.user.mention} challenged you to UNO" + (f" for **{fmt(wager)} each**." if wager else "."),
-        view=view,
-    )
+    await interaction.response.send_message(f"🃏 {member.mention}, {interaction.user.mention} challenged you to UNO" + (f" for **{fmt(wager)} each**." if wager else "."), view=ChallengeView(interaction.user, member, "uno", wager))
 
 
 if not TOKEN:
