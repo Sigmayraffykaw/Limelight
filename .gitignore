@@ -1,0 +1,4 @@
+.env
+limelight.db
+__pycache__/
+*.pyc
